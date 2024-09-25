@@ -3,7 +3,6 @@
 #include <cstdlib>
 #include <iterator>
 
-
 template <std::size_t extent>
 struct SpanBase {
   constexpr SpanBase() noexcept = default;
