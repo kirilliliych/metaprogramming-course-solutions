@@ -7,7 +7,7 @@ constexpr std::size_t SBO_SIZE = 64;
 
 struct LogMeta {
   unsigned int accessCount = 0;
-  unsigned int unprocessedCallsCount = 0;
+  unsigned int unprocessedAccessCount = 0;
 };
 
 template <class T, class Allocator = std::allocator<std::byte>>
@@ -19,13 +19,15 @@ class Spy {
     
     T* operator->() {
       ++(*spy_).logInfo_.accessCount;
-      ++(*spy_).logInfo_.unprocessedCallsCount;
+      ++(*spy_).logInfo_.unprocessedAccessCount;
       return &((*spy_).value_);
     }
 
     ~SpyHelper() {
-      if (--(*spy_).logInfo_.unprocessedCallsCount == 0) {
-        (*spy_).call_((*spy_).logger_, (*spy_).logInfo_.accessCount);
+      if (--(*spy_).logInfo_.unprocessedAccessCount == 0) {
+        if ((*spy_).call_ != nullptr) {
+          (*spy_).call_((*spy_).logger_, (*spy_).logInfo_.accessCount);
+        }
         (*spy_).logInfo_.accessCount = 0;
       }
     }
@@ -67,22 +69,23 @@ class Spy {
     requires std::copyable<T> {
     if (this != &other) {
       resetLogger();
+    
+      if (other.copy_) {
+        other.copy_(logger_, other.logger_, allocator_);
+      }
+
+      if constexpr (std::is_same_v<typename AllocTraits::propagate_on_container_copy_assignment, std::true_type>)
+        allocator_ = other.allocator_;
 
       destructor_ = other.destructor_;
       call_ = other.call_; 
       copy_ = other.copy_;
       move_ = other.move_;
-      value_ = other.value_;
-    
-      if (copy_) {
-        copy_(logger_, other.logger_, allocator_);
-      }
-
-      if constexpr (std::is_same_v<typename AllocTraits::propagate_on_container_copy_assignment, std::true_type>)
-        allocator_ = other.allocator_;
       
+      value_ = other.value_;
       logInfo_.accessCount = 0;
-      logInfo_.unprocessedCallsCount = 0;
+      logInfo_.unprocessedAccessCount = 0;
+
     }
     return *this;
   }
@@ -126,9 +129,7 @@ class Spy {
       }
     
       value_ = std::move(other.value_);
-      logInfo_.accessCount = other.logInfo_.accessCount;
-      logInfo_.unprocessedCallsCount = other.logInfo_.unprocessedCallsCount;
-      other.logInfo_ = LogMeta();
+      logInfo_ = std::exchange(other.logInfo_, LogMeta());
     }
     return *this;
   }
@@ -163,8 +164,8 @@ class Spy {
     if constexpr (sizeof(Logger) <= SBO_SIZE) {
       AllocTraits::construct(allocator_, reinterpret_cast<LoggerNoRef*>(logger_.sboLogger.data()), std::forward<Logger>(logger));
     } else {
-      logger_.unlimitedLogger = allocator_.allocate(sizeof(Logger));
-      AllocTraits::construct(allocator_, reinterpret_cast<LoggerNoRef*>(logger_.unlimitedLogger), std::forward<Logger>(logger));
+      logger_.unboundedLogger = allocator_.allocate(sizeof(Logger));
+      AllocTraits::construct(allocator_, reinterpret_cast<LoggerNoRef*>(logger_.unboundedLogger), std::forward<Logger>(logger));
     }
     call_ = &call<LoggerNoRef>;
     copy_ = &copy<LoggerNoRef>;
@@ -174,7 +175,7 @@ class Spy {
 
  private:
   union LoggerType {
-    void* unlimitedLogger;
+    void* unboundedLogger;
     std::array<std::byte, SBO_SIZE> sboLogger;
   };
 
@@ -184,30 +185,32 @@ class Spy {
       LoggerImpl* logger = reinterpret_cast<LoggerImpl*>(ptr.sboLogger.data());
       (*logger)(arg);
     } else {
-      (*static_cast<LoggerImpl*>(ptr.unlimitedLogger))(arg);
+      (*static_cast<LoggerImpl*>(ptr.unboundedLogger))(arg);
     }
   }
 
-  template<class LoggerImpl>
+  template <class LoggerImpl>
   static void copy(LoggerType& to, const LoggerType& from, Allocator allocator) {
-    if constexpr (std::copy_constructible<LoggerImpl>) {
+    if constexpr (std::copyable<LoggerImpl>) {
       if constexpr (sizeof(LoggerImpl) <= SBO_SIZE) {
         AllocTraits::construct(allocator, reinterpret_cast<LoggerImpl*>(to.sboLogger.data()), *(reinterpret_cast<const LoggerImpl*>(from.sboLogger.data())));
       } else {
-        to.unlimitedLogger = allocator.allocate(sizeof(LoggerImpl));
-        AllocTraits::construct(allocator, static_cast<LoggerImpl*>(to.unlimitedLogger), *static_cast<LoggerImpl*>(from.unlimitedLogger));
+        to.unboundedLogger = allocator.allocate(sizeof(LoggerImpl));
+        AllocTraits::construct(allocator, static_cast<LoggerImpl*>(to.unboundedLogger), *static_cast<LoggerImpl*>(from.unboundedLogger));
       }
     }
   }
 
-  template<class LoggerImpl>
+  template <class LoggerImpl>
   static void move(LoggerType& to, LoggerType& from, Allocator allocator) {
-    if constexpr (sizeof(LoggerImpl) <= SBO_SIZE) {
-      auto* logger = const_cast<LoggerImpl*>(reinterpret_cast<const LoggerImpl*>(from.sboLogger.data()));
-      AllocTraits::construct(allocator, reinterpret_cast<LoggerImpl*>(to.sboLogger.data()), std::move(*logger));
-      AllocTraits::destroy(allocator, logger);
-    } else {
-      to.unlimitedLogger = std::exchange(from.unlimitedLogger, nullptr);
+    if constexpr (std::movable<LoggerImpl>) {
+      if constexpr (sizeof(LoggerImpl) <= SBO_SIZE) {
+        auto* logger = const_cast<LoggerImpl*>(reinterpret_cast<const LoggerImpl*>(from.sboLogger.data()));
+        AllocTraits::construct(allocator, reinterpret_cast<LoggerImpl*>(to.sboLogger.data()), std::move(*logger));
+        AllocTraits::destroy(allocator, logger);
+      } else {
+        to.unboundedLogger = std::exchange(from.unboundedLogger, nullptr);
+      }
     }
   }
 
@@ -216,8 +219,8 @@ class Spy {
     if constexpr (sizeof(LoggerImpl) <= SBO_SIZE) {
       AllocTraits::destroy(allocator, reinterpret_cast<LoggerImpl*>(ptr.sboLogger.data()));
     } else {
-      AllocTraits::destroy(allocator, static_cast<LoggerImpl*>(ptr.unlimitedLogger));
-      allocator.deallocate(static_cast<std::byte*>(ptr.unlimitedLogger), sizeof(LoggerImpl));
+      AllocTraits::destroy(allocator, static_cast<LoggerImpl*>(ptr.unboundedLogger));
+      allocator.deallocate(static_cast<std::byte*>(ptr.unboundedLogger), sizeof(LoggerImpl));
     }
   }
 
